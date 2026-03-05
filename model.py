@@ -1,71 +1,109 @@
 
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-import xgboost as xgb
 import os
-import io
+import torch
+import numpy as np
+import xgboost as xgb
 
-MODEL_NAME = 'distilbert-base-multilingual-cased'
-NUM_LABELS = 2
-NUM_PARTS_FLOAT16 = 11
+from transformers import DistilBertModel, DistilBertConfig, DistilBertTokenizerFast
 
-def reconstruct_float16_model(output_dir, num_parts, model_name, num_labels):
-    reconstructed_bytes_buffer = io.BytesIO()
-    for i in range(1, num_parts + 1):
-        part_file_path = os.path.join(output_dir, f'float16_distilbert_part_{i}.bin_part')
-        with open(part_file_path, 'rb') as f:
-            reconstructed_bytes_buffer.write(f.read())
-    reconstructed_bytes_buffer.seek(0)
-    reconstructed_state_dict = torch.load(reconstructed_bytes_buffer, map_location=torch.device('cpu'))
-    base_model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=num_labels)
-    reconstructed_model = base_model.half()
-    reconstructed_model.load_state_dict(reconstructed_state_dict)
-    return reconstructed_model
 
-class ScamDetectorModel:
+MODEL_FILE = "distilbert_model.bin"
+
+
+# -----------------------------
+# Merge DistilBERT split files
+# -----------------------------
+def merge_model_parts():
+    if os.path.exists(MODEL_FILE):
+        return
+
+    print("Merging DistilBERT model parts...")
+
+    with open(MODEL_FILE, "wb") as outfile:
+        i = 1
+        while True:
+            part_name = f"float16_distilbert_part_{i}.bin_part"
+
+            if not os.path.exists(part_name):
+                break
+
+            with open(part_name, "rb") as infile:
+                outfile.write(infile.read())
+
+            i += 1
+
+    print("Model merge completed")
+
+
+# -----------------------------
+# Load models only once
+# -----------------------------
+class ScamModel:
+
     def __init__(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(".") 
-        self.distilbert_model = self.load_distilbert_model()
-        self.xgboost_model = self.load_xgboost_model()
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.distilbert_model.to(self.device)
-        self.distilbert_model.eval()
 
-    def load_distilbert_model(self):
-        print("Loading (and reconstructing) float16 DistilBERT model...")
-        model = reconstruct_float16_model(
-            ".", NUM_PARTS_FLOAT16, MODEL_NAME, NUM_LABELS
-        )
-        print("Float16 DistilBERT model loaded.")
-        return model
+        merge_model_parts()
 
-    def load_xgboost_model(self):
+        print("Loading tokenizer...")
+        self.tokenizer = DistilBertTokenizerFast.from_pretrained(".", local_files_only=True)
+
+        print("Loading DistilBERT config...")
+        config = DistilBertConfig.from_pretrained("config.json")
+
+        print("Loading DistilBERT model...")
+        self.bert = DistilBertModel(config)
+
+        state_dict = torch.load(MODEL_FILE, map_location="cpu")
+        self.bert.load_state_dict(state_dict)
+
+        self.bert.eval()
+
         print("Loading XGBoost model...")
-        xgb_model = xgb.XGBClassifier(use_label_encoder=False, eval_metric='logloss')
-        xgb_model.load_model(os.path.join(".", 'xgboost_model.json'))
-        print("XGBoost model loaded.")
-        return xgb_model
+        self.xgb = xgb.XGBClassifier()
+        self.xgb.load_model("xgboost_model.json")
 
-    def get_cls_embedding(self, text):
-        encoding = self.tokenizer(
-            str(text),
-            add_special_tokens=True,
-            max_length=128,
-            padding='max_length',
-            return_attention_mask=True,
-            return_tensors='pt',
-            truncation=True
+        print("SmartCall model loaded successfully")
+
+
+    # -----------------------------
+    # Get embedding from DistilBERT
+    # -----------------------------
+    def get_embedding(self, text):
+
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=128
         )
-        input_ids = encoding['input_ids'].to(self.device)
-        attention_mask = encoding['attention_mask'].to(self.device)
 
         with torch.no_grad():
-            outputs = self.distilbert_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
-            cls_embedding = outputs.hidden_states[-1][:, 0, :].cpu().numpy()
-        return cls_embedding
+            outputs = self.bert(**inputs)
 
-    def predict_scam(self, text: str):
-        cls_embedding = self.get_cls_embedding(text)
-        prediction = self.xgboost_model.predict(cls_embedding)
-        probability = self.xgboost_model.predict_proba(cls_embedding)[:, 1]
-        return {"label": int(prediction[0]), "probability": float(probability[0])}
+        embedding = outputs.last_hidden_state[:, 0, :].numpy()
+
+        return embedding
+
+
+    # -----------------------------
+    # Prediction pipeline
+    # -----------------------------
+    def predict(self, text):
+
+        embedding = self.get_embedding(text)
+
+        prob = self.xgb.predict_proba(embedding)[0][1]
+
+        if prob > 0.5:
+            label = "scam"
+        else:
+            label = "not scam"
+
+        return label, float(prob)
+
+
+# -----------------------------
+# Global model instance
+# -----------------------------
+scam_model = ScamModel()
